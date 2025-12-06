@@ -3,6 +3,7 @@ import cors from 'cors';
 import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
 import twilio from 'twilio';
+import crypto from 'crypto';
 
 // Load environment variables
 dotenv.config();
@@ -11,8 +12,23 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 
 // Middleware
+const allowedOrigins = [
+  process.env.FRONTEND_URL || 'http://localhost:3000',
+  process.env.ADMIN_CONSOLE_URL || 'http://localhost:3001',
+  'http://localhost:3000',
+  'http://localhost:3001',
+];
+
 app.use(cors({
-  origin: process.env.FRONTEND_URL || 'http://localhost:3000',
+  origin: (origin, callback) => {
+    // Allow requests with no origin (like mobile apps or curl requests)
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.indexOf(origin) !== -1) {
+      callback(null, true);
+    } else {
+      callback(null, true); // Allow all origins for now (restrict in production)
+    }
+  },
   credentials: true
 }));
 app.use(express.json());
@@ -89,6 +105,7 @@ app.post('/api/signup', async (req, res) => {
       email,
       phone,
       investmentAmount,
+      profitSharing,
       country,
       mt5Login,
       mt5Password,
@@ -181,6 +198,7 @@ app.post('/api/signup', async (req, res) => {
           email: email,
           phone: phone,
           investment_amount: parseFloat(investmentAmount),
+          profit_sharing: profitSharing ? parseFloat(profitSharing) : null,
           country: country,
           partner_id: partnerId || null,
           email_verified: emailVerified,
@@ -952,6 +970,620 @@ app.get('/api/users/:userId', async (req, res) => {
     res.status(500).json({
       success: false,
       error: 'Internal server error'
+    });
+  }
+});
+
+// ============================================
+// ADMIN API ENDPOINTS
+// ============================================
+
+// Get all users (admin)
+app.get('/api/admin/users', async (req, res) => {
+  try {
+    const { 
+      page = 1, 
+      limit = 50, 
+      status, 
+      partnerId,
+      search 
+    } = req.query;
+
+    const pageNum = parseInt(page);
+    const limitNum = parseInt(limit);
+    const offset = (pageNum - 1) * limitNum;
+
+    let query = supabase
+      .from('users')
+      .select(`
+        *,
+        partners (
+          id,
+          name,
+          email,
+          company_name
+        )
+      `, { count: 'exact' })
+      .order('created_at', { ascending: false })
+      .range(offset, offset + limitNum - 1);
+
+    // Apply filters
+    if (status) {
+      query = query.eq('status', status);
+    }
+
+    if (partnerId) {
+      query = query.eq('partner_id', partnerId);
+    }
+
+    if (search) {
+      query = query.or(`full_name.ilike.%${search}%,email.ilike.%${search}%,phone.ilike.%${search}%`);
+    }
+
+    const { data, error, count } = await query;
+
+    if (error) {
+      console.error('Error fetching users:', error);
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to fetch users'
+      });
+    }
+
+    res.json({
+      success: true,
+      data: data || [],
+      pagination: {
+        page: pageNum,
+        limit: limitNum,
+        total: count || 0,
+        totalPages: Math.ceil((count || 0) / limitNum)
+      }
+    });
+
+  } catch (error) {
+    console.error('Server error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error'
+    });
+  }
+});
+
+// Get all users with MT5 accounts (admin)
+app.get('/api/admin/users/with-mt5', async (req, res) => {
+  try {
+    const { page = 1, limit = 50 } = req.query;
+
+    const pageNum = parseInt(page);
+    const limitNum = parseInt(limit);
+    const offset = (pageNum - 1) * limitNum;
+
+    // Get users with their MT5 logins
+    const { data: users, error: usersError, count } = await supabase
+      .from('users')
+      .select(`
+        *,
+        partners (
+          id,
+          name,
+          email,
+          company_name
+        ),
+        mt5_logins (
+          id,
+          login,
+          server,
+          is_active,
+          is_primary,
+          created_at
+        )
+      `, { count: 'exact' })
+      .order('created_at', { ascending: false })
+      .range(offset, offset + limitNum - 1);
+
+    if (usersError) {
+      console.error('Error fetching users with MT5:', usersError);
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to fetch users'
+      });
+    }
+
+    res.json({
+      success: true,
+      data: users || [],
+      pagination: {
+        page: pageNum,
+        limit: limitNum,
+        total: count || 0,
+        totalPages: Math.ceil((count || 0) / limitNum)
+      }
+    });
+
+  } catch (error) {
+    console.error('Server error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error'
+    });
+  }
+});
+
+// Get all partners with their users (admin)
+app.get('/api/admin/partners/with-users', async (req, res) => {
+  try {
+    const { status } = req.query;
+
+    let query = supabase
+      .from('partners')
+      .select(`
+        *,
+        users (
+          id,
+          full_name,
+          email,
+          phone,
+          investment_amount,
+          country,
+          status,
+          created_at
+        )
+      `)
+      .order('created_at', { ascending: false });
+
+    if (status) {
+      query = query.eq('status', status);
+    }
+
+    const { data, error } = await query;
+
+    if (error) {
+      console.error('Error fetching partners with users:', error);
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to fetch partners'
+      });
+    }
+
+    // Transform data to include user count
+    const partnersWithStats = (data || []).map(partner => ({
+      ...partner,
+      user_count: partner.users?.length || 0,
+      total_investment: partner.users?.reduce((sum, user) => sum + parseFloat(user.investment_amount || 0), 0) || 0
+    }));
+
+    res.json({
+      success: true,
+      data: partnersWithStats
+    });
+
+  } catch (error) {
+    console.error('Server error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error'
+    });
+  }
+});
+
+// Get dashboard statistics (admin)
+app.get('/api/admin/dashboard/stats', async (req, res) => {
+  try {
+    // Get total users
+    const { count: totalUsers } = await supabase
+      .from('users')
+      .select('*', { count: 'exact', head: true });
+
+    // Get active users
+    const { count: activeUsers } = await supabase
+      .from('users')
+      .select('*', { count: 'exact', head: true })
+      .eq('status', 'active');
+
+    // Get total partners
+    const { count: totalPartners } = await supabase
+      .from('partners')
+      .select('*', { count: 'exact', head: true });
+
+    // Get active partners
+    const { count: activePartners } = await supabase
+      .from('partners')
+      .select('*', { count: 'exact', head: true })
+      .eq('status', 'active');
+
+    // Get total investment amount
+    const { data: investmentData } = await supabase
+      .from('users')
+      .select('investment_amount');
+
+    const totalInvestment = investmentData?.reduce(
+      (sum, user) => sum + parseFloat(user.investment_amount || 0), 
+      0
+    ) || 0;
+
+    // Get total MT5 accounts
+    const { count: totalMT5Accounts } = await supabase
+      .from('mt5_logins')
+      .select('*', { count: 'exact', head: true });
+
+    // Get recent users (last 7 days)
+    const sevenDaysAgo = new Date();
+    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+    
+    const { count: recentUsers } = await supabase
+      .from('users')
+      .select('*', { count: 'exact', head: true })
+      .gte('created_at', sevenDaysAgo.toISOString());
+
+    res.json({
+      success: true,
+      data: {
+        totalUsers: totalUsers || 0,
+        activeUsers: activeUsers || 0,
+        pendingUsers: (totalUsers || 0) - (activeUsers || 0),
+        totalPartners: totalPartners || 0,
+        activePartners: activePartners || 0,
+        totalInvestment,
+        totalMT5Accounts: totalMT5Accounts || 0,
+        recentUsers: recentUsers || 0
+      }
+    });
+
+  } catch (error) {
+    console.error('Server error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error'
+    });
+  }
+});
+
+// ============================================
+// INVITE MANAGEMENT ENDPOINTS
+// ============================================
+
+// Generate unique token for invite
+function generateInviteToken() {
+  return crypto.randomBytes(32).toString('hex');
+}
+
+// Create invite and send email
+app.post('/api/admin/invites', async (req, res) => {
+  try {
+    const { email, investmentAmount, profitSharing } = req.body;
+
+    if (!email || !investmentAmount || profitSharing === undefined) {
+      return res.status(400).json({
+        success: false,
+        error: 'Email, investment amount, and profit sharing are required'
+      });
+    }
+
+    // Validate email format
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid email format'
+      });
+    }
+
+    // Validate profit sharing (0-100)
+    const profitSharingNum = parseFloat(profitSharing);
+    if (isNaN(profitSharingNum) || profitSharingNum < 0 || profitSharingNum > 100) {
+      return res.status(400).json({
+        success: false,
+        error: 'Profit sharing must be between 0 and 100'
+      });
+    }
+
+    // Generate unique token
+    const token = generateInviteToken();
+    
+    // Get frontend URL for invite links (use production URL for invites)
+    const inviteFrontendUrl = process.env.INVITE_FRONTEND_URL || process.env.FRONTEND_URL || 'https://baessolutions.com';
+    const inviteLink = `${inviteFrontendUrl}/signup?invite=${token}&profitSharing=${profitSharingNum}`;
+
+    // Create invite in database
+    const { data: invite, error: inviteError } = await supabase
+      .from('invites')
+      .insert([
+        {
+          email,
+          investment_amount: parseFloat(investmentAmount),
+          profit_sharing: profitSharingNum,
+          token,
+          status: 'pending',
+          expires_at: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(), // 30 days
+          created_by: req.headers['x-admin-email'] || 'admin'
+        }
+      ])
+      .select()
+      .single();
+
+    if (inviteError) {
+      console.error('Error creating invite:', inviteError);
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to create invite',
+        details: inviteError.message
+      });
+    }
+
+    // Send email with invite link
+    let emailSent = false;
+    let emailError = null;
+
+    if (sendGridApiKey) {
+      try {
+        console.log(`Attempting to send invite email to ${email}...`);
+        const emailBody = `
+          <html>
+            <body style="font-family: Arial, sans-serif; padding: 20px; background-color: #f5f5f5;">
+              <div style="max-width: 600px; margin: 0 auto; background-color: white; padding: 30px; border-radius: 8px;">
+                <h2 style="color: #333; margin-bottom: 20px;">Welcome to BAES Solutions</h2>
+                <p style="color: #666; line-height: 1.6;">
+                  You have been invited to join BAES Solutions. Please use the link below to complete your registration.
+                </p>
+                <div style="background-color: #f9f9f9; padding: 20px; border-radius: 4px; margin: 20px 0;">
+                  <p style="margin: 5px 0; color: #333;"><strong>Investment Amount:</strong> $${parseFloat(investmentAmount).toLocaleString()}</p>
+                  <p style="margin: 5px 0; color: #333;"><strong>Profit Sharing:</strong> ${profitSharingNum}%</p>
+                </div>
+                <div style="text-align: center; margin: 30px 0;">
+                  <a href="${inviteLink}" 
+                     style="display: inline-block; background-color: #0066cc; color: white; padding: 12px 30px; text-decoration: none; border-radius: 4px; font-weight: bold;">
+                    Complete Registration
+                  </a>
+                </div>
+                <p style="color: #999; font-size: 12px; margin-top: 30px;">
+                  This invite link will expire in 30 days. If you didn't request this invitation, please ignore this email.
+                </p>
+                <hr style="border: none; border-top: 1px solid #eee; margin: 30px 0;">
+                <p style="color: #666; font-size: 12px;">BAES Solutions LLC</p>
+              </div>
+            </body>
+          </html>
+        `;
+
+        const response = await fetch('https://api.sendgrid.com/v3/mail/send', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${sendGridApiKey}`,
+          },
+          body: JSON.stringify({
+            personalizations: [
+              {
+                to: [{ email }],
+                subject: 'Invitation to Join BAES Solutions',
+              },
+            ],
+            from: {
+              email: sendGridFromEmail,
+            },
+            content: [
+              {
+                type: 'text/html',
+                value: emailBody,
+              },
+            ],
+          }),
+        });
+
+        if (!response.ok) {
+          const errorText = await response.text();
+          console.error('SendGrid API error:', {
+            status: response.status,
+            statusText: response.statusText,
+            body: errorText,
+            email: email,
+            fromEmail: sendGridFromEmail,
+          });
+          emailError = `SendGrid API error: ${response.status} ${response.statusText} - ${errorText}`;
+          throw new Error(emailError);
+        }
+
+        emailSent = true;
+        console.log(`✓ Invite email successfully sent to ${email}`);
+      } catch (emailError) {
+        console.error('Error sending invite email via SendGrid:', {
+          error: emailError.message,
+          stack: emailError.stack,
+          email: email,
+          sendGridConfigured: !!sendGridApiKey,
+          fromEmail: sendGridFromEmail,
+        });
+        emailError = emailError.message || 'Unknown error sending email';
+      }
+    } else {
+      console.warn('SendGrid API key not configured. Invite email not sent.');
+      emailError = 'SendGrid API key not configured';
+    }
+
+    // Return response with email status
+    res.status(201).json({
+      success: true,
+      message: emailSent 
+        ? 'Invite created and email sent successfully' 
+        : 'Invite created successfully, but email could not be sent',
+      data: {
+        invite,
+        inviteLink,
+        emailSent,
+        emailError: emailError || null,
+      },
+    });
+
+  } catch (error) {
+    console.error('Server error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+      details: error.message,
+    });
+  }
+});
+
+// Get invite by token (for frontend to validate)
+app.get('/api/invites/:token', async (req, res) => {
+  try {
+    const { token } = req.params;
+
+    const { data: invite, error } = await supabase
+      .from('invites')
+      .select('*')
+      .eq('token', token)
+      .single();
+
+    if (error || !invite) {
+      return res.status(404).json({
+        success: false,
+        error: 'Invite not found or invalid',
+      });
+    }
+
+    if (new Date(invite.expires_at) < new Date()) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invite has expired',
+      });
+    }
+
+    if (invite.status === 'used') {
+      return res.status(400).json({
+        success: false,
+        error: 'Invite has already been used',
+      });
+    }
+
+    res.json({
+      success: true,
+      data: {
+        email: invite.email,
+        investmentAmount: invite.investment_amount,
+        profitSharing: invite.profit_sharing,
+      },
+    });
+
+  } catch (error) {
+    console.error('Server error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
+    });
+  }
+});
+
+// Get all invites (admin)
+app.get('/api/admin/invites', async (req, res) => {
+  try {
+    const { status, page = 1, limit = 50 } = req.query;
+
+    const pageNum = parseInt(page);
+    const limitNum = parseInt(limit);
+    const offset = (pageNum - 1) * limitNum;
+
+    let query = supabase
+      .from('invites')
+      .select(`
+        *,
+        users (
+          id,
+          full_name,
+          email
+        )
+      `, { count: 'exact' })
+      .order('created_at', { ascending: false })
+      .range(offset, offset + limitNum - 1);
+
+    if (status) {
+      query = query.eq('status', status);
+    }
+
+    const { data, error, count } = await query;
+
+    if (error) {
+      console.error('Error fetching invites:', error);
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to fetch invites'
+      });
+    }
+
+    res.json({
+      success: true,
+      data: data || [],
+      pagination: {
+        page: pageNum,
+        limit: limitNum,
+        total: count || 0,
+        totalPages: Math.ceil((count || 0) / limitNum)
+      }
+    });
+
+  } catch (error) {
+    console.error('Server error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error'
+    });
+  }
+});
+
+// Mark invite as used when user signs up
+app.post('/api/invites/:token/use', async (req, res) => {
+  try {
+    const { token } = req.params;
+    const { userId } = req.body;
+
+    const { data: invite, error: fetchError } = await supabase
+      .from('invites')
+      .select('*')
+      .eq('token', token)
+      .single();
+
+    if (fetchError || !invite) {
+      return res.status(404).json({
+        success: false,
+        error: 'Invite not found',
+      });
+    }
+
+    if (invite.status === 'used') {
+      return res.status(400).json({
+        success: false,
+        error: 'Invite has already been used',
+      });
+    }
+
+    const { error: updateError } = await supabase
+      .from('invites')
+      .update({
+        status: 'used',
+        used_at: new Date().toISOString(),
+        used_by_user_id: userId || null,
+      })
+      .eq('token', token);
+
+    if (updateError) {
+      console.error('Error updating invite:', updateError);
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to mark invite as used',
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'Invite marked as used',
+    });
+
+  } catch (error) {
+    console.error('Server error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error',
     });
   }
 });
