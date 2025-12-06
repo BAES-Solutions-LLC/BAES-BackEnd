@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: baes-solutions-backend
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        sync: false  # Render will set this automatically
+    healthCheckPath: /health
+
