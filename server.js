@@ -5,6 +5,7 @@ import { createClient } from '@supabase/supabase-js';
 import twilio from 'twilio';
 import crypto from 'crypto';
 import bcrypt from 'bcrypt';
+import jwt from 'jsonwebtoken';
 
 // Load environment variables
 dotenv.config();
@@ -77,6 +78,14 @@ const OTP_LENGTH = 6;
 // Password hashing configuration
 const BCRYPT_SALT_ROUNDS = 10;
 
+// JWT Configuration
+const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-this-in-production';
+const JWT_EXPIRY = process.env.JWT_EXPIRY || '24h'; // Token expires in 24 hours
+
+if (!process.env.JWT_SECRET && process.env.NODE_ENV === 'production') {
+  console.warn('⚠️  WARNING: Using default JWT_SECRET. Set JWT_SECRET environment variable in production!');
+}
+
 // Helper function to generate OTP
 function generateOTP() {
   return Math.floor(100000 + Math.random() * 900000).toString();
@@ -106,9 +115,315 @@ async function verifyPassword(plainPassword, hashedPassword) {
   return await bcrypt.compare(plainPassword, hashedPassword);
 }
 
+// Middleware to verify JWT token
+function authenticateToken(req, res, next) {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1]; // Bearer TOKEN
+
+  if (!token) {
+    return res.status(401).json({
+      success: false,
+      error: 'Authentication required. Please provide a valid token.'
+    });
+  }
+
+  jwt.verify(token, JWT_SECRET, (err, admin) => {
+    if (err) {
+      return res.status(403).json({
+        success: false,
+        error: 'Invalid or expired token. Please login again.'
+      });
+    }
+
+    req.admin = admin; // Attach admin info to request
+    next();
+  });
+}
+
+// Middleware to check admin role
+function requireRole(...allowedRoles) {
+  return (req, res, next) => {
+    if (!req.admin) {
+      return res.status(401).json({
+        success: false,
+        error: 'Authentication required'
+      });
+    }
+
+    if (!allowedRoles.includes(req.admin.role)) {
+      return res.status(403).json({
+        success: false,
+        error: 'Insufficient permissions'
+      });
+    }
+
+    next();
+  };
+}
+
+// Helper function to log admin actions
+async function logAdminAction(adminId, adminEmail, action, resourceType, resourceId, details, req) {
+  try {
+    await supabase
+      .from('admin_audit_logs')
+      .insert([
+        {
+          admin_id: adminId,
+          admin_email: adminEmail,
+          action,
+          resource_type: resourceType,
+          resource_id: resourceId,
+          details: details || {},
+          ip_address: req.ip || req.headers['x-forwarded-for'] || req.connection.remoteAddress,
+          user_agent: req.headers['user-agent']
+        }
+      ]);
+  } catch (error) {
+    console.error('Error logging admin action:', error);
+    // Don't fail the request if logging fails
+  }
+}
+
 // Health check endpoint
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', message: 'Server is running' });
+});
+
+// ============================================
+// ADMIN AUTHENTICATION ENDPOINTS
+// ============================================
+
+// Admin login endpoint
+app.post('/api/admin/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    if (!email || !password) {
+      return res.status(400).json({
+        success: false,
+        error: 'Email and password are required'
+      });
+    }
+
+    // Fetch admin by email
+    const { data: admin, error } = await supabase
+      .from('admins')
+      .select('id, email, password, full_name, role, is_active')
+      .eq('email', email.toLowerCase())
+      .single();
+
+    if (error || !admin) {
+      // Don't reveal whether email exists for security
+      return res.status(401).json({
+        success: false,
+        error: 'Invalid email or password'
+      });
+    }
+
+    // Check if admin is active
+    if (!admin.is_active) {
+      return res.status(403).json({
+        success: false,
+        error: 'Account is disabled. Please contact administrator.'
+      });
+    }
+
+    // Verify password
+    const isPasswordValid = await verifyPassword(password, admin.password);
+
+    if (!isPasswordValid) {
+      // Log failed login attempt
+      await logAdminAction(
+        admin.id,
+        admin.email,
+        'login_failed',
+        'admin',
+        admin.id,
+        { reason: 'invalid_password' },
+        req
+      );
+
+      return res.status(401).json({
+        success: false,
+        error: 'Invalid email or password'
+      });
+    }
+
+    // Update last login time
+    await supabase
+      .from('admins')
+      .update({ last_login_at: new Date().toISOString() })
+      .eq('id', admin.id);
+
+    // Generate JWT token
+    const token = jwt.sign(
+      {
+        id: admin.id,
+        email: admin.email,
+        role: admin.role,
+        fullName: admin.full_name
+      },
+      JWT_SECRET,
+      { expiresIn: JWT_EXPIRY }
+    );
+
+    // Log successful login
+    await logAdminAction(
+      admin.id,
+      admin.email,
+      'login_success',
+      'admin',
+      admin.id,
+      {},
+      req
+    );
+
+    // Return token and admin data (excluding password)
+    res.json({
+      success: true,
+      message: 'Login successful',
+      data: {
+        token,
+        admin: {
+          id: admin.id,
+          email: admin.email,
+          fullName: admin.full_name,
+          role: admin.role
+        }
+      }
+    });
+
+  } catch (error) {
+    console.error('Admin login error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error'
+    });
+  }
+});
+
+// Verify token endpoint (for frontend to check if token is still valid)
+app.get('/api/admin/verify', authenticateToken, async (req, res) => {
+  try {
+    // Fetch fresh admin data
+    const { data: admin, error } = await supabase
+      .from('admins')
+      .select('id, email, full_name, role, is_active')
+      .eq('id', req.admin.id)
+      .single();
+
+    if (error || !admin || !admin.is_active) {
+      return res.status(401).json({
+        success: false,
+        error: 'Invalid or expired session'
+      });
+    }
+
+    res.json({
+      success: true,
+      data: {
+        admin: {
+          id: admin.id,
+          email: admin.email,
+          fullName: admin.full_name,
+          role: admin.role
+        }
+      }
+    });
+
+  } catch (error) {
+    console.error('Token verification error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error'
+    });
+  }
+});
+
+// Change admin password
+app.post('/api/admin/change-password', authenticateToken, async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body;
+
+    if (!currentPassword || !newPassword) {
+      return res.status(400).json({
+        success: false,
+        error: 'Current password and new password are required'
+      });
+    }
+
+    // Validate new password strength
+    if (newPassword.length < 8) {
+      return res.status(400).json({
+        success: false,
+        error: 'New password must be at least 8 characters long'
+      });
+    }
+
+    // Fetch current admin data
+    const { data: admin, error } = await supabase
+      .from('admins')
+      .select('id, email, password')
+      .eq('id', req.admin.id)
+      .single();
+
+    if (error || !admin) {
+      return res.status(404).json({
+        success: false,
+        error: 'Admin not found'
+      });
+    }
+
+    // Verify current password
+    const isPasswordValid = await verifyPassword(currentPassword, admin.password);
+
+    if (!isPasswordValid) {
+      return res.status(401).json({
+        success: false,
+        error: 'Current password is incorrect'
+      });
+    }
+
+    // Hash new password
+    const hashedPassword = await hashPassword(newPassword);
+
+    // Update password
+    const { error: updateError } = await supabase
+      .from('admins')
+      .update({ password: hashedPassword, updated_at: new Date().toISOString() })
+      .eq('id', admin.id);
+
+    if (updateError) {
+      console.error('Error updating password:', updateError);
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to update password'
+      });
+    }
+
+    // Log password change
+    await logAdminAction(
+      admin.id,
+      admin.email,
+      'password_changed',
+      'admin',
+      admin.id,
+      {},
+      req
+    );
+
+    res.json({
+      success: true,
+      message: 'Password changed successfully'
+    });
+
+  } catch (error) {
+    console.error('Change password error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error'
+    });
+  }
 });
 
 // Signup endpoint
@@ -884,7 +1199,7 @@ app.get('/api/partners/:id/statistics', async (req, res) => {
 });
 
 // Update partner (admin)
-app.put('/api/admin/partners/:partnerId', async (req, res) => {
+app.put('/api/admin/partners/:partnerId', authenticateToken, requireRole('admin', 'super_admin'), async (req, res) => {
   try {
     const { partnerId } = req.params;
     const { name, email, phone, companyName, commissionRate, notes, status } = req.body;
@@ -967,7 +1282,7 @@ app.put('/api/admin/partners/:partnerId', async (req, res) => {
 });
 
 // Delete partner (admin)
-app.delete('/api/admin/partners/:partnerId', async (req, res) => {
+app.delete('/api/admin/partners/:partnerId', authenticateToken, requireRole('admin', 'super_admin'), async (req, res) => {
   try {
     const { partnerId } = req.params;
     const { cascade } = req.query;
@@ -1046,7 +1361,7 @@ app.delete('/api/admin/partners/:partnerId', async (req, res) => {
 });
 
 // Update partner status (admin)
-app.patch('/api/admin/partners/:partnerId/status', async (req, res) => {
+app.patch('/api/admin/partners/:partnerId/status', authenticateToken, requireRole('admin', 'super_admin'), async (req, res) => {
   try {
     const { partnerId } = req.params;
     const { status } = req.body;
@@ -1301,7 +1616,7 @@ app.get('/api/users/:userId', async (req, res) => {
 });
 
 // Update MT5 login (admin)
-app.put('/api/admin/mt5-logins/:mt5LoginId', async (req, res) => {
+app.put('/api/admin/mt5-logins/:mt5LoginId', authenticateToken, requireRole('admin', 'super_admin'), async (req, res) => {
   try {
     const { mt5LoginId } = req.params;
     const { login, password, server, isActive, isPrimary } = req.body;
@@ -1400,7 +1715,7 @@ app.put('/api/admin/mt5-logins/:mt5LoginId', async (req, res) => {
 });
 
 // Delete MT5 login (admin)
-app.delete('/api/admin/mt5-logins/:mt5LoginId', async (req, res) => {
+app.delete('/api/admin/mt5-logins/:mt5LoginId', authenticateToken, requireRole('admin', 'super_admin'), async (req, res) => {
   try {
     const { mt5LoginId } = req.params;
 
@@ -1743,7 +2058,7 @@ app.get('/api/admin/dashboard/stats', async (req, res) => {
 });
 
 // Update user details (admin)
-app.put('/api/admin/users/:userId', async (req, res) => {
+app.put('/api/admin/users/:userId', authenticateToken, requireRole('admin', 'super_admin'), async (req, res) => {
   try {
     const { userId } = req.params;
     const {
@@ -1867,7 +2182,7 @@ app.put('/api/admin/users/:userId', async (req, res) => {
 });
 
 // Delete user (admin)
-app.delete('/api/admin/users/:userId', async (req, res) => {
+app.delete('/api/admin/users/:userId', authenticateToken, requireRole('admin', 'super_admin'), async (req, res) => {
   try {
     const { userId } = req.params;
     const { cascade } = req.query; // Option to cascade delete related data
@@ -1962,7 +2277,7 @@ app.delete('/api/admin/users/:userId', async (req, res) => {
 });
 
 // Update user status (admin - quick status change)
-app.patch('/api/admin/users/:userId/status', async (req, res) => {
+app.patch('/api/admin/users/:userId/status', authenticateToken, requireRole('admin', 'super_admin'), async (req, res) => {
   try {
     const { userId } = req.params;
     const { status } = req.body;
