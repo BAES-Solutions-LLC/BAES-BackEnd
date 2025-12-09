@@ -13,6 +13,7 @@
   "license": "MIT",
   "dependencies": {
     "@supabase/supabase-js": "^2.39.3",
+    "axios": "^1.13.2",
     "bcrypt": "^6.0.0",
     "cors": "^2.8.5",
     "dotenv": "^16.3.1",

@@ -92,24 +92,11 @@ if (!process.env.JWT_SECRET && process.env.NODE_ENV === 'production') {
 
 // MetaAPI Configuration
 const METAAPI_TOKEN = process.env.METAAPI_TOKEN;
-const METAAPI_REGION = process.env.METAAPI_REGION; // Optional: 'new-york' or 'london'
 let metaApi = null;
 
 if (METAAPI_TOKEN) {
   try {
-    // Initialize MetaAPI
-    // Note: For JavaScript SDK, region is auto-detected from broker server
-    // But can be overridden via environment variable if needed
-    const metaApiOptions = {};
-    
-    // Only set region if explicitly configured (not recommended for JS SDK)
-    // MetaAPI will auto-detect based on broker server
-    if (METAAPI_REGION) {
-      console.log(`⚠️  Using explicit MetaAPI region: ${METAAPI_REGION}`);
-      console.log('Note: Region auto-detection is preferred. Only use this if you know the correct region.');
-    }
-    
-    metaApi = new MetaApi(METAAPI_TOKEN, metaApiOptions);
+    metaApi = new MetaApi(METAAPI_TOKEN);
     console.log('✓ MetaAPI initialized successfully');
   } catch (error) {
     console.error('⚠️  MetaAPI initialization failed:', error.message);
@@ -316,27 +303,6 @@ async function syncMT5Metrics(mt5LoginId) {
     if (!account) {
       console.log(`Creating new MetaAPI account for MT5 login ${mt5Login.login}...`);
       
-      // Detect region based on server name (rough heuristics)
-      // MetaAPI will auto-detect, but we can provide hints
-      let suggestedRegion = null;
-      const serverLower = mt5Login.server.toLowerCase();
-      
-      // Common region indicators in broker server names
-      if (serverLower.includes('london') || serverLower.includes('uk') || 
-          serverLower.includes('europe') || serverLower.includes('eu')) {
-        suggestedRegion = 'london';
-      } else if (serverLower.includes('newyork') || serverLower.includes('ny') || 
-                 serverLower.includes('usa') || serverLower.includes('us')) {
-        suggestedRegion = 'new-york';
-      }
-      
-      // Log region detection for debugging
-      if (suggestedRegion) {
-        console.log(`Detected region: ${suggestedRegion} for server: ${mt5Login.server}`);
-      } else {
-        console.log(`No region detected from server name: ${mt5Login.server}. MetaAPI will auto-detect.`);
-      }
-      
       // Create new MetaAPI account
       const accountData = {
         name: `MT5-${mt5Login.login}`,
@@ -346,9 +312,7 @@ async function syncMT5Metrics(mt5LoginId) {
         password: plainMT5Password, // Decrypted password for MetaAPI
         server: mt5Login.server,
         platform: 'mt5',
-        magic: 0,
-        // Add region if detected (helps with faster connection)
-        ...(suggestedRegion && { region: suggestedRegion })
+        magic: 0
       };
 
       try {
@@ -373,81 +337,194 @@ async function syncMT5Metrics(mt5LoginId) {
       } catch (deployError) {
         throw new Error(`Account deployment failed: ${deployError.message}. This may be due to invalid credentials or broker server issues.`);
       }
+
+      // Enable MetaStats API
+      console.log(`Enabling MetaStats API for account ${account.id}...`);
+      try {
+        const axios = (await import('axios')).default;
+        await axios.post(
+          `https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai/users/current/accounts/${account.id}/enable-metastats-api`,
+          {},
+          {
+            headers: {
+              'auth-token': METAAPI_TOKEN
+            }
+          }
+        );
+        console.log(`MetaStats API enabled for account ${account.id}`);
+      } catch (enableError) {
+        console.warn(`Warning: Failed to enable MetaStats: ${enableError.response?.data?.message || enableError.message}`);
+        // Don't throw, account is already deployed
+      }
     } else {
       console.log(`Using existing MetaAPI account ${account.id} for MT5 login ${mt5Login.login}`);
       
-      // Ensure account is deployed
-      if (account.state !== 'DEPLOYED') {
+      // Check actual account state via API
+      const axios = (await import('axios')).default;
+      let currentState;
+      try {
+        const stateResponse = await axios.get(
+          `https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai/users/current/accounts/${account.id}`,
+          {
+            headers: {
+              'auth-token': METAAPI_TOKEN
+            }
+          }
+        );
+        currentState = stateResponse.data;
+        console.log(`Current account state: ${currentState.state}, Connection: ${currentState.connectionStatus}`);
+      } catch (stateError) {
+        console.warn(`Could not fetch account state: ${stateError.message}`);
+      }
+
+      // Only deploy if not already deployed or deploying
+      if (currentState?.state !== 'DEPLOYED' && currentState?.state !== 'DEPLOYING') {
         console.log(`Deploying existing MetaAPI account ${account.id}...`);
         await account.deploy();
         await account.waitDeployed({ timeoutInSeconds: 300 });
+        console.log(`Account ${account.id} deployed successfully`);
+      } else if (currentState?.state === 'DEPLOYING') {
+        console.log(`Account ${account.id} is already deploying, will wait for connection in metrics sync`);
+      } else {
+        console.log(`Account ${account.id} is already deployed`);
+      }
+
+      // Ensure MetaStats API is enabled
+      console.log(`Ensuring MetaStats API is enabled for account ${account.id}...`);
+      try {
+        await axios.post(
+          `https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai/users/current/accounts/${account.id}/enable-metastats-api`,
+          {},
+          {
+            headers: {
+              'auth-token': METAAPI_TOKEN
+            }
+          }
+        );
+        console.log(`MetaStats API enabled for account ${account.id}`);
+      } catch (enableError) {
+        // Ignore errors if already enabled
+        console.warn(`Note: MetaStats enable returned: ${enableError.response?.status || enableError.message}`);
       }
     }
 
-    // Wait for connection with extended timeout
-    const connection = account.getStreamingConnection();
-    await connection.connect();
+    // Use MetaAPI HTTP endpoints instead of streaming (more reliable)
+    console.log(`Fetching metrics for account ${account.id} via MetaStats API...`);
     
-    // Wait for synchronization with timeout (5 minutes)
+    // Import axios for HTTP requests
+    const axios = (await import('axios')).default;
+    
+    // Step 1: Check account state and get region (with retry for deploying accounts)
+    let accountState;
+    const maxRetries = 10;
+    const retryDelayMs = 10000; // 10 seconds
+    
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        const stateResponse = await axios.get(
+          `https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai/users/current/accounts/${account.id}`,
+          {
+            headers: {
+              'auth-token': METAAPI_TOKEN
+            }
+          }
+        );
+        accountState = stateResponse.data;
+        console.log(`[Attempt ${attempt}/${maxRetries}] Account state: ${accountState.state}, Connection status: ${accountState.connectionStatus}, Region: ${accountState.region}`);
+        
+        // Check if account is ready (deployed and connected)
+        if (accountState.state === 'DEPLOYED' && accountState.connectionStatus === 'CONNECTED') {
+          console.log(`Account ${account.id} is ready (deployed and connected)`);
+          break;
+        }
+        
+        // If still deploying or disconnected, wait and retry
+        if (attempt < maxRetries) {
+          console.log(`Account not ready yet. Waiting ${retryDelayMs/1000} seconds before retry...`);
+          await new Promise(resolve => setTimeout(resolve, retryDelayMs));
+        } else {
+          // Last attempt failed
+          throw new Error(`MT5 account not ready after ${maxRetries} attempts. State: ${accountState.state}, Connection: ${accountState.connectionStatus}. Please verify credentials.`);
+        }
+      } catch (stateError) {
+        if (attempt === maxRetries) {
+          throw new Error(`Failed to fetch account state: ${stateError.response?.data?.message || stateError.message}`);
+        }
+        console.log(`Error checking state, retrying in ${retryDelayMs/1000} seconds...`);
+        await new Promise(resolve => setTimeout(resolve, retryDelayMs));
+      }
+    }
+
+    // Final validation
+    if (!accountState || accountState.connectionStatus !== 'CONNECTED') {
+      throw new Error(`MT5 account is not connected to broker. Current status: ${accountState?.connectionStatus || 'UNKNOWN'}. Please verify credentials and ensure the account is accessible.`);
+    }
+
+    // Get region for MetaStats API
+    const region = accountState.region || 'london';
+    const metricsUrl = `https://metastats-api-v1.${region}.agiliumtrade.ai/users/current/accounts/${account.id}/metrics`;
+    console.log(`Fetching metrics from: ${metricsUrl}`);
+
+    // Step 2: Fetch metrics from MetaStats API using the correct region
+    let metricsData;
     try {
-      await connection.waitSynchronized({ 
-        timeoutInSeconds: 300,
-        applicationPattern: 'MetaApi'
+      const metricsResponse = await axios.get(metricsUrl, {
+        headers: {
+          'auth-token': METAAPI_TOKEN
+        }
       });
-    } catch (syncError) {
-      throw new Error(`Synchronization timeout: ${syncError.message}. The MT5 account may not be connected to the broker or credentials may be invalid.`);
+      metricsData = metricsResponse.data;
+      console.log(`Successfully fetched metrics for account ${account.id}`);
+    } catch (metricsError) {
+      throw new Error(`Failed to fetch metrics: ${metricsError.response?.data?.message || metricsError.message}. Account may need more time to synchronize with broker.`);
     }
 
-    // Get account information
-    accountInfo = connection.accountInformation;
-    
-    // Check if account information is available
-    if (!accountInfo || typeof accountInfo !== 'object') {
-      await connection.close();
-      throw new Error('Account information not available after synchronization. Please verify MT5 account credentials and ensure the account is connected to the broker.');
+    // Check if metrics data is available
+    if (!metricsData || typeof metricsData !== 'object') {
+      throw new Error('Metrics data not available. Account may still be synchronizing with broker.');
     }
 
-    // Check if balance exists (basic validation)
-    if (accountInfo.balance === undefined && accountInfo.equity === undefined) {
-      await connection.close();
-      throw new Error('Account information incomplete. The account may be using incorrect credentials or the broker server is not responding.');
+    // Extract metrics from nested structure
+    const accountMetrics = metricsData.metrics || metricsData;
+
+    // Validate essential metrics
+    if (accountMetrics.balance === undefined && accountMetrics.equity === undefined) {
+      throw new Error('Account metrics incomplete. Please verify MT5 credentials and ensure account is connected to broker.');
     }
 
-    const positions = connection.positions || [];
-    const orders = connection.orders || [];
+    // Calculate margin level if we have margin
+    const marginLevel = accountMetrics.margin > 0 
+      ? (accountMetrics.equity / accountMetrics.margin) * 100 
+      : 0;
 
     // Format metrics with safe access
     const metrics = {
-      balance: accountInfo.balance ?? 0,
-      equity: accountInfo.equity ?? 0,
-      margin: accountInfo.margin ?? 0,
-      freeMargin: accountInfo.freeMargin ?? 0,
-      marginLevel: accountInfo.marginLevel ?? 0,
-      profit: accountInfo.profit ?? 0,
-      credit: accountInfo.credit ?? 0,
-      leverage: accountInfo.leverage ?? 0,
-      currency: accountInfo.currency || 'USD',
-      type: accountInfo.type || 'hedging',
-      name: accountInfo.name || '',
-      server: accountInfo.server || mt5Login.server,
-      positions: positions.length,
-      orders: orders.length,
+      balance: accountMetrics.balance ?? 0,
+      equity: accountMetrics.equity ?? 0,
+      margin: accountMetrics.margin ?? 0,
+      freeMargin: accountMetrics.freeMargin ?? 0,
+      marginLevel: marginLevel,
+      profit: accountMetrics.profit ?? 0,
+      credit: accountMetrics.credit ?? 0,
+      leverage: accountMetrics.leverage ?? 0,
+      currency: accountMetrics.currency || 'USD',
+      type: accountMetrics.type || 'hedging',
+      name: accountState.name || '',
+      server: mt5Login.server,
+      positions: accountMetrics.openPositions ?? accountMetrics.trades ?? 0,
+      orders: accountMetrics.openOrders ?? 0,
+      deposits: accountMetrics.deposits ?? 0,
+      equityPercent: accountMetrics.equityPercent ?? 100,
       accountInfo: {
-        name: accountInfo.name || '',
+        name: accountState.name || '',
         login: mt5Login.login,
         server: mt5Login.server,
-        platform: 'mt5'
+        platform: 'mt5',
+        connectionStatus: accountState.connectionStatus,
+        state: accountState.state
       },
       lastUpdate: new Date().toISOString()
     };
-
-    // Close connection
-    try {
-      await connection.close();
-    } catch (closeError) {
-      console.warn('Warning: Failed to close connection:', closeError.message);
-      // Don't throw, we already have the data
-    }
 
     // Update database with metrics
     const { error: updateError } = await supabase
@@ -3190,7 +3267,7 @@ app.delete('/api/admin/invites/:inviteId', authenticateToken, requireRole('admin
     // Check if invite exists
     const { data: existingInvite, error: checkError } = await supabase
       .from('invites')
-      .select('id, email, status, token')
+      .select('id, email, status, token, used_by_user_id')
       .eq('id', inviteId)
       .single();
 
@@ -3201,20 +3278,7 @@ app.delete('/api/admin/invites/:inviteId', authenticateToken, requireRole('admin
       });
     }
 
-    // Check if invite is already used
-    if (existingInvite.status === 'used') {
-      return res.status(400).json({
-        success: false,
-        error: 'Cannot delete an invite that has already been used. Delete the user instead.',
-        invite: {
-          id: existingInvite.id,
-          email: existingInvite.email,
-          status: existingInvite.status
-        }
-      });
-    }
-
-    // Delete the invite
+    // Delete the invite (now allowed for all statuses including used)
     const { error: deleteError } = await supabase
       .from('invites')
       .delete()
