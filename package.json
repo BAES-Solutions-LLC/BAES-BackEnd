@@ -18,6 +18,7 @@
     "dotenv": "^16.3.1",
     "express": "^4.21.2",
     "jsonwebtoken": "^9.0.3",
+    "metaapi.cloud-sdk": "^29.3.2",
     "twilio": "^5.3.5"
   }
 }

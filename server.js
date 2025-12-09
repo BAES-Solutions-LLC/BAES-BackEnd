@@ -6,6 +6,10 @@ import twilio from 'twilio';
 import crypto from 'crypto';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
+// Use require for MetaAPI to avoid ESM web version
+import { createRequire } from 'module';
+const require = createRequire(import.meta.url);
+const MetaApi = require('metaapi.cloud-sdk').default;
 
 // Load environment variables
 dotenv.config();
@@ -86,6 +90,21 @@ if (!process.env.JWT_SECRET && process.env.NODE_ENV === 'production') {
   console.warn('⚠️  WARNING: Using default JWT_SECRET. Set JWT_SECRET environment variable in production!');
 }
 
+// MetaAPI Configuration
+const METAAPI_TOKEN = process.env.METAAPI_TOKEN;
+let metaApi = null;
+
+if (METAAPI_TOKEN) {
+  try {
+    metaApi = new MetaApi(METAAPI_TOKEN);
+    console.log('✓ MetaAPI initialized successfully');
+  } catch (error) {
+    console.error('⚠️  MetaAPI initialization failed:', error.message);
+  }
+} else {
+  console.warn('⚠️  WARNING: METAAPI_TOKEN not found. MT5 metrics sync will not work.');
+}
+
 // Helper function to generate OTP
 function generateOTP() {
   return Math.floor(100000 + Math.random() * 900000).toString();
@@ -113,6 +132,62 @@ async function hashPassword(password) {
 // Helper function to verify passwords (for login authentication)
 async function verifyPassword(plainPassword, hashedPassword) {
   return await bcrypt.compare(plainPassword, hashedPassword);
+}
+
+// MT5 Password Encryption Configuration
+const MT5_ENCRYPTION_KEY = process.env.MT5_PASSWORD_ENCRYPTION_KEY;
+const MT5_ENCRYPTION_ALGORITHM = 'aes-256-cbc';
+
+if (!MT5_ENCRYPTION_KEY && process.env.NODE_ENV === 'production') {
+  console.warn('⚠️  WARNING: MT5_PASSWORD_ENCRYPTION_KEY not set. Generate with: node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'hex\'))"');
+}
+
+// Helper function to encrypt MT5 passwords (allows decryption for MetaAPI)
+function encryptMT5Password(password) {
+  if (!MT5_ENCRYPTION_KEY) {
+    // In development, if no key is set, return password as-is with warning
+    console.warn('⚠️  MT5 password not encrypted - set MT5_PASSWORD_ENCRYPTION_KEY');
+    return password;
+  }
+  
+  try {
+    const iv = crypto.randomBytes(16);
+    const key = Buffer.from(MT5_ENCRYPTION_KEY, 'hex');
+    const cipher = crypto.createCipheriv(MT5_ENCRYPTION_ALGORITHM, key, iv);
+    let encrypted = cipher.update(password, 'utf8', 'hex');
+    encrypted += cipher.final('hex');
+    return iv.toString('hex') + ':' + encrypted;
+  } catch (error) {
+    console.error('Error encrypting MT5 password:', error);
+    throw new Error('Failed to encrypt MT5 password');
+  }
+}
+
+// Helper function to decrypt MT5 passwords (needed for MetaAPI connection)
+function decryptMT5Password(encryptedPassword) {
+  if (!MT5_ENCRYPTION_KEY) {
+    // In development, if no key is set, assume password is plain text
+    return encryptedPassword;
+  }
+  
+  try {
+    const parts = encryptedPassword.split(':');
+    if (parts.length !== 2) {
+      // Password might not be encrypted (old data or dev mode)
+      return encryptedPassword;
+    }
+    
+    const iv = Buffer.from(parts[0], 'hex');
+    const encrypted = parts[1];
+    const key = Buffer.from(MT5_ENCRYPTION_KEY, 'hex');
+    const decipher = crypto.createDecipheriv(MT5_ENCRYPTION_ALGORITHM, key, iv);
+    let decrypted = decipher.update(encrypted, 'hex', 'utf8');
+    decrypted += decipher.final('utf8');
+    return decrypted;
+  } catch (error) {
+    console.error('Error decrypting MT5 password:', error);
+    throw new Error('Failed to decrypt MT5 password');
+  }
 }
 
 // Middleware to verify JWT token
@@ -181,6 +256,144 @@ async function logAdminAction(adminId, adminEmail, action, resourceType, resourc
   } catch (error) {
     console.error('Error logging admin action:', error);
     // Don't fail the request if logging fails
+  }
+}
+
+// Helper function to sync MT5 metrics from MetaAPI
+async function syncMT5Metrics(mt5LoginId) {
+  if (!metaApi) {
+    throw new Error('MetaAPI not initialized');
+  }
+
+  try {
+    // Get MT5 login details
+    const { data: mt5Login, error: fetchError } = await supabase
+      .from('mt5_logins')
+      .select('id, login, password, server, metaapi_account_id')
+      .eq('id', mt5LoginId)
+      .single();
+
+    if (fetchError || !mt5Login) {
+      throw new Error('MT5 login not found');
+    }
+
+    // Update status to syncing
+    await supabase
+      .from('mt5_logins')
+      .update({ sync_status: 'syncing' })
+      .eq('id', mt5LoginId);
+
+    let account;
+    let accountInfo;
+
+    // If we already have a MetaAPI account ID, use it
+    if (mt5Login.metaapi_account_id) {
+      try {
+        account = await metaApi.metatraderAccountApi.getAccount(mt5Login.metaapi_account_id);
+      } catch (error) {
+        // Account not found or invalid, we'll create a new one
+        console.log('Existing MetaAPI account not found, creating new one');
+      }
+    }
+
+    // Decrypt MT5 password for MetaAPI connection
+    const plainMT5Password = decryptMT5Password(mt5Login.password);
+
+    // Create or update MetaAPI account
+    if (!account) {
+      // Create new MetaAPI account
+      const accountData = {
+        name: `MT5-${mt5Login.login}`,
+        type: 'cloud',
+        login: mt5Login.login,
+        // Note: Password should be investor (read-only) password for security
+        password: plainMT5Password, // Decrypted password for MetaAPI
+        server: mt5Login.server,
+        platform: 'mt5',
+        magic: 0
+      };
+
+      account = await metaApi.metatraderAccountApi.createAccount(accountData);
+      
+      // Store MetaAPI account ID
+      await supabase
+        .from('mt5_logins')
+        .update({ metaapi_account_id: account.id })
+        .eq('id', mt5LoginId);
+
+      // Wait for account to deploy
+      await account.deploy();
+      await account.waitDeployed();
+    }
+
+    // Wait for connection
+    const connection = account.getStreamingConnection();
+    await connection.connect();
+    await connection.waitSynchronized();
+
+    // Get account information
+    accountInfo = connection.accountInformation;
+    const positions = connection.positions;
+    const orders = connection.orders;
+
+    // Format metrics
+    const metrics = {
+      balance: accountInfo.balance || 0,
+      equity: accountInfo.equity || 0,
+      margin: accountInfo.margin || 0,
+      freeMargin: accountInfo.freeMargin || 0,
+      marginLevel: accountInfo.marginLevel || 0,
+      profit: accountInfo.profit || 0,
+      credit: accountInfo.credit || 0,
+      leverage: accountInfo.leverage || 0,
+      currency: accountInfo.currency || 'USD',
+      type: accountInfo.type || 'hedging',
+      name: accountInfo.name || '',
+      server: accountInfo.server || mt5Login.server,
+      positions: positions?.length || 0,
+      orders: orders?.length || 0,
+      accountInfo: {
+        name: accountInfo.name,
+        login: mt5Login.login,
+        server: mt5Login.server,
+        platform: 'mt5'
+      },
+      lastUpdate: new Date().toISOString()
+    };
+
+    // Close connection
+    await connection.close();
+
+    // Update database with metrics
+    const { error: updateError } = await supabase
+      .from('mt5_logins')
+      .update({
+        metrics: metrics,
+        metrics_last_synced: new Date().toISOString(),
+        sync_status: 'success',
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', mt5LoginId);
+
+    if (updateError) {
+      throw new Error(`Failed to update metrics: ${updateError.message}`);
+    }
+
+    return { success: true, metrics };
+
+  } catch (error) {
+    console.error('Error syncing MT5 metrics:', error);
+
+    // Update status to failed
+    await supabase
+      .from('mt5_logins')
+      .update({ 
+        sync_status: 'failed',
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', mt5LoginId);
+
+    throw error;
   }
 }
 
@@ -436,20 +649,36 @@ app.post('/api/signup', async (req, res) => {
       investmentAmount,
       profitSharing,
       country,
-      mt5Login,
-      mt5Password,
-      mt5Server,
+      mt5Accounts, // Array of MT5 accounts
       emailVerified,
       phoneVerified,
       partnerId // Optional: partner ID if user was referred by a partner
     } = req.body;
 
     // Validation
-    if (!fullName || !email || !phone || !investmentAmount || !country || !mt5Login || !mt5Password || !mt5Server) {
+    if (!fullName || !email || !phone || !investmentAmount || !country) {
       return res.status(400).json({
         success: false,
         error: 'Missing required fields'
       });
+    }
+
+    // Validate MT5 accounts
+    if (!mt5Accounts || !Array.isArray(mt5Accounts) || mt5Accounts.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'At least one MT5 account is required'
+      });
+    }
+
+    // Validate each MT5 account
+    for (const account of mt5Accounts) {
+      if (!account.mt5Login || !account.mt5Password || !account.mt5Server) {
+        return res.status(400).json({
+          success: false,
+          error: 'Each MT5 account must have login, password, and server'
+        });
+      }
     }
 
     if (!emailVerified || !phoneVerified) {
@@ -503,19 +732,21 @@ app.post('/api/signup', async (req, res) => {
       }
     }
 
-    // Check if MT5 login already exists for this server
-    const { data: existingMT5, error: mt5CheckError } = await supabase
-      .from('mt5_logins')
-      .select('id')
-      .eq('login', mt5Login)
-      .eq('server', mt5Server)
-      .single();
+    // Check if any MT5 login already exists for this server
+    for (const account of mt5Accounts) {
+      const { data: existingMT5 } = await supabase
+        .from('mt5_logins')
+        .select('id')
+        .eq('login', account.mt5Login)
+        .eq('server', account.mt5Server)
+        .single();
 
-    if (existingMT5) {
-      return res.status(409).json({
-        success: false,
-        error: 'MT5 login already exists for this server'
-      });
+      if (existingMT5) {
+        return res.status(409).json({
+          success: false,
+          error: `MT5 login ${account.mt5Login} already exists for server ${account.mt5Server}`
+        });
+      }
     }
 
     // Insert user data into Supabase (without MT5 fields)
@@ -548,35 +779,54 @@ app.post('/api/signup', async (req, res) => {
       });
     }
 
-    // Hash the MT5 password before storing
-    const hashedMT5Password = await bcrypt.hash(mt5Password, BCRYPT_SALT_ROUNDS);
+    // Insert all MT5 login accounts
+    const mt5InsertPromises = mt5Accounts.map(async (account, index) => {
+      // Encrypt the MT5 password (not hash, so MetaAPI can decrypt and use it)
+      const encryptedMT5Password = encryptMT5Password(account.mt5Password);
 
-    // Insert MT5 login data
+      return {
+        user_id: userData.id,
+        login: account.mt5Login,
+        password: encryptedMT5Password, // Password is encrypted (not hashed) for MetaAPI
+        server: account.mt5Server,
+        is_active: true,
+        is_primary: index === 0, // First MT5 login is primary
+        created_at: new Date().toISOString()
+      };
+    });
+
+    // Wait for all password encryption to complete
+    const mt5DataToInsert = await Promise.all(mt5InsertPromises);
+
+    // Insert all MT5 logins at once
     const { data: mt5Data, error: mt5Error } = await supabase
       .from('mt5_logins')
-      .insert([
-        {
-          user_id: userData.id,
-          login: mt5Login,
-          password: hashedMT5Password, // Password is now hashed with bcrypt
-          server: mt5Server,
-          is_active: true,
-          is_primary: true, // First MT5 login is primary
-          created_at: new Date().toISOString()
-        }
-      ])
-      .select()
-      .single();
+      .insert(mt5DataToInsert)
+      .select();
 
     if (mt5Error) {
-      console.error('Supabase error creating MT5 login:', mt5Error);
+      console.error('Supabase error creating MT5 logins:', mt5Error);
       // Rollback: delete the user if MT5 insertion fails
       await supabase.from('users').delete().eq('id', userData.id);
       
       return res.status(500).json({
         success: false,
-        error: 'Failed to create MT5 login',
+        error: 'Failed to create MT5 logins',
         details: mt5Error.message
+      });
+    }
+
+    // Trigger metrics sync for all MT5 accounts in background (don't wait for it)
+    if (metaApi && mt5Data) {
+      mt5Data.forEach(mt5 => {
+        syncMT5Metrics(mt5.id)
+          .then(() => {
+            console.log(`✓ Initial metrics synced for MT5 login ${mt5.login}`);
+          })
+          .catch((error) => {
+            console.error(`✗ Failed to sync initial metrics for MT5 login ${mt5.login}:`, error.message);
+            // Don't fail signup if metrics sync fails
+          });
       });
     }
 
@@ -587,7 +837,8 @@ app.post('/api/signup', async (req, res) => {
         id: userData.id,
         email: userData.email,
         fullName: userData.full_name,
-        mt5LoginId: mt5Data.id
+        mt5LoginCount: mt5Data.length,
+        mt5LoginIds: mt5Data.map(mt5 => mt5.id)
       }
     });
 
@@ -1676,9 +1927,9 @@ app.put('/api/admin/mt5-logins/:mt5LoginId', authenticateToken, requireRole('adm
     if (isActive !== undefined) updateData.is_active = isActive;
     if (isPrimary !== undefined) updateData.is_primary = isPrimary;
 
-    // Hash password if provided
+    // Encrypt password if provided (not hash, so MetaAPI can use it)
     if (password !== undefined) {
-      updateData.password = await hashPassword(password);
+      updateData.password = encryptMT5Password(password);
     }
 
     // Update MT5 login
@@ -1787,6 +2038,126 @@ app.delete('/api/admin/mt5-logins/:mt5LoginId', authenticateToken, requireRole('
     res.status(500).json({
       success: false,
       error: 'Internal server error',
+      details: error.message
+    });
+  }
+});
+
+// ============================================
+// MT5 METRICS SYNC ENDPOINTS
+// ============================================
+
+// Sync MT5 metrics (admin)
+app.post('/api/admin/mt5-logins/:mt5LoginId/sync-metrics', authenticateToken, requireRole('admin', 'super_admin'), async (req, res) => {
+  try {
+    const { mt5LoginId } = req.params;
+
+    if (!metaApi) {
+      return res.status(503).json({
+        success: false,
+        error: 'MetaAPI service not configured. Please contact administrator.'
+      });
+    }
+
+    // Check if MT5 login exists
+    const { data: mt5Login, error: checkError } = await supabase
+      .from('mt5_logins')
+      .select('id, login, server, sync_status')
+      .eq('id', mt5LoginId)
+      .single();
+
+    if (checkError || !mt5Login) {
+      return res.status(404).json({
+        success: false,
+        error: 'MT5 login not found'
+      });
+    }
+
+    // Check if already syncing
+    if (mt5Login.sync_status === 'syncing') {
+      return res.status(409).json({
+        success: false,
+        error: 'Metrics sync already in progress'
+      });
+    }
+
+    // Log the sync action
+    if (req.admin) {
+      await logAdminAction(
+        req.admin.id,
+        req.admin.email,
+        'mt5_metrics_sync',
+        'mt5_login',
+        mt5LoginId,
+        { login: mt5Login.login, server: mt5Login.server },
+        req
+      );
+    }
+
+    // Sync metrics in background
+    syncMT5Metrics(mt5LoginId)
+      .then((result) => {
+        console.log(`✓ Metrics synced successfully for MT5 login ${mt5Login.login}`);
+      })
+      .catch((error) => {
+        console.error(`✗ Failed to sync metrics for MT5 login ${mt5Login.login}:`, error.message);
+      });
+
+    res.json({
+      success: true,
+      message: 'Metrics sync started',
+      data: {
+        mt5LoginId,
+        status: 'syncing'
+      }
+    });
+
+  } catch (error) {
+    console.error('Error starting metrics sync:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to start metrics sync',
+      details: error.message
+    });
+  }
+});
+
+// Get MT5 metrics (admin)
+app.get('/api/admin/mt5-logins/:mt5LoginId/metrics', authenticateToken, requireRole('admin', 'super_admin', 'viewer'), async (req, res) => {
+  try {
+    const { mt5LoginId } = req.params;
+
+    const { data: mt5Login, error } = await supabase
+      .from('mt5_logins')
+      .select('id, login, server, metrics, metrics_last_synced, sync_status, is_active')
+      .eq('id', mt5LoginId)
+      .single();
+
+    if (error || !mt5Login) {
+      return res.status(404).json({
+        success: false,
+        error: 'MT5 login not found'
+      });
+    }
+
+    res.json({
+      success: true,
+      data: {
+        id: mt5Login.id,
+        login: mt5Login.login,
+        server: mt5Login.server,
+        metrics: mt5Login.metrics || null,
+        metricsLastSynced: mt5Login.metrics_last_synced,
+        syncStatus: mt5Login.sync_status,
+        isActive: mt5Login.is_active
+      }
+    });
+
+  } catch (error) {
+    console.error('Error fetching MT5 metrics:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to fetch metrics',
       details: error.message
     });
   }
