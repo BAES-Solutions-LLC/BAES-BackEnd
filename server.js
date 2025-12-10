@@ -334,8 +334,9 @@ async function syncMT5Metrics(mt5LoginId) {
       }
     }
 
-    // Step 4: Check if still deploying
+    // Step 4: Check if still deploying or not connected
     if (accountState.state === 'DEPLOYING' || accountState.connectionStatus !== 'CONNECTED') {
+      // Set status to deploying so frontend can retry
       await supabase
         .from('mt5_logins')
         .update({ 
@@ -344,16 +345,14 @@ async function syncMT5Metrics(mt5LoginId) {
         })
         .eq('id', mt5LoginId);
       
-      throw new Error(`Account is still being deployed and connecting to broker. State: ${accountState.state}, Connection: ${accountState.connectionStatus}. Please wait a few minutes and try again.`);
+      // Throw error that will be caught by error handler
+      throw new Error(`DEPLOYING: Account is still being deployed and connecting to broker. State: ${accountState.state}, Connection: ${accountState.connectionStatus}. Please wait a few minutes and try again.`);
     }
 
-    // Step 5: Update status to syncing
-    await supabase
-      .from('mt5_logins')
-      .update({ sync_status: 'syncing' })
-      .eq('id', mt5LoginId);
+    // Account is deployed and connected, proceed with metrics fetch
+    // Status is already 'syncing' from the endpoint
 
-    // Step 6: Get region for MetaStats API
+    // Step 5: Get region for MetaStats API
     const region = accountState.region || 'new-york';
     const metricsUrl = `https://metastats-api-v1.${region}.agiliumtrade.ai/users/current/accounts/${account.id}/metrics`;
     console.log(`Fetching metrics from: ${metricsUrl}`);
@@ -443,18 +442,20 @@ async function syncMT5Metrics(mt5LoginId) {
     let errorMessage = error.message;
     let syncStatus = 'failed';
     
-    if (error.message?.includes('still being deployed') || error.message?.includes('DEPLOYING')) {
+    if (error.message?.includes('DEPLOYING') || error.message?.includes('still being deployed') || error.message?.includes('not connected to broker yet')) {
       syncStatus = 'deploying';
-      errorMessage = 'Account is being deployed and connecting to broker. This may take a few minutes.';
+      // Extract clean message without prefix
+      errorMessage = error.message.replace('DEPLOYING: ', '');
+      // Make it cleaner for frontend
+      if (errorMessage.includes('State:') || errorMessage.includes('Connection:')) {
+        errorMessage = 'Account is being deployed and connecting to broker. Please wait a few minutes and try again.';
+      }
     } else if (error.message?.includes('timeout') || error.message?.includes('Timeout')) {
       errorMessage = 'Connection timeout. Account may not be connected to broker.';
     } else if (error.message?.includes('credentials') || error.message?.includes('authentication')) {
       errorMessage = 'Invalid MT5 credentials. Please verify login, password, and server.';
     } else if (error.message?.includes('not found')) {
       errorMessage = 'MT5 account not found in database.';
-    } else if (error.message?.includes('not connected to broker yet')) {
-      syncStatus = 'deploying';
-      errorMessage = 'Account is deploying. Please wait a few minutes.';
     }
 
     // Update status with error message
@@ -2652,6 +2653,15 @@ app.post('/api/admin/mt5-logins/:mt5LoginId/sync-metrics', authenticateToken, re
         req
       );
     }
+
+    // Set initial status to syncing
+    await supabase
+      .from('mt5_logins')
+      .update({ 
+        sync_status: 'syncing',
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', mt5LoginId);
 
     // Sync metrics in background
     syncMT5Metrics(mt5LoginId)
